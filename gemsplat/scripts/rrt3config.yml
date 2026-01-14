@@ -1,0 +1,5 @@
+algorithm: 'RRT*'
+dimension: '2'
+prevent_edge_overlap: 'y'
+exact_step: 'n'
+bounded_step: 'y'
