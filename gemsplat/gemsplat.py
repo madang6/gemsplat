@@ -658,29 +658,88 @@ class GemSplatModel(SplatfactoModel):
         # to save some training time, we no longer need to update those stats post refinement
         if self.step >= self.config.stop_split_at:
             return
-        
+
         with torch.no_grad():
-            # keep track of a moving average of grad norms
-            visible_mask = (self.radii > 0).flatten()
-            
-            assert self.xys.grad is not None
-            grads = self.xys.grad.detach().norm(dim=-1)
-            # print(f"grad norm min {grads.min().item()} max {grads.max().item()} mean {grads.mean().item()} size {grads.shape}")
-            if self.xys_grad_norm is None:
-                self.xys_grad_norm = grads
-                self.vis_counts = torch.ones_like(self.xys_grad_norm)
+            # Check if we have the necessary info from rasterization
+            if not hasattr(self, 'info') or self.info is None:
+                return
+            if "radii" not in self.info or "means2d" not in self.info:
+                return
+
+            means2d = self.info["means2d"]
+
+            # Get 2D gradients from means2d - use absgrad if available (set by gsplat when absgrad=True)
+            # Fall back to .grad if absgrad not available
+            if hasattr(means2d, 'absgrad') and means2d.absgrad is not None:
+                grads_2d = means2d.absgrad.clone()  # [C, N, 2] for packed=False
+            elif means2d.grad is not None:
+                grads_2d = means2d.grad.clone()  # [C, N, 2] for packed=False
             else:
-                assert self.vis_counts is not None
-                self.vis_counts[visible_mask] = self.vis_counts[visible_mask] + 1
-                self.xys_grad_norm[visible_mask] = grads[visible_mask] + self.xys_grad_norm[visible_mask]
+                # No gradients available - this is the problematic case
+                # Debug: print warning on first occurrence
+                if not hasattr(self, '_warned_no_grad'):
+                    print(f"[WARNING] means2d has no absgrad or grad at step {step}. Densification will be impaired.")
+                    self._warned_no_grad = True
+                return
+
+            # With packed=False, radii is [C, N] where C=1, grads_2d is [C, N, 2]
+            radii = self.info["radii"]  # [C, N]
+            H, W = self.last_size
+
+            # Select visible Gaussians (radii > 0)
+            # For packed=False mode: radii is [C, N], grads_2d is [C, N, 2]
+            sel = radii > 0.0  # [C, N]
+            gs_ids = torch.where(sel)[1]  # [nnz] - indices of visible Gaussians
+            grads_2d = grads_2d[sel]  # [nnz, 2]
+            radii_sel = radii[sel]  # [nnz]
+
+            # Normalize gradients to [-1, 1] screen space (following DefaultStrategy)
+            # This is what gsplat's DefaultStrategy does in _update_state
+            n_cameras = 1  # We render one camera at a time
+            grads_2d[..., 0] *= W / 2.0 * n_cameras
+            grads_2d[..., 1] *= H / 2.0 * n_cameras
+
+            # Compute gradient norm
+            grads = grads_2d.norm(dim=-1)  # [nnz]
+
+            # Number of total Gaussians
+            num_gaussians = self.num_points
+
+            # Initialize tracking tensors for all Gaussians if needed
+            if self.xys_grad_norm is None:
+                self.xys_grad_norm = torch.zeros(num_gaussians, device=self.device)
+                self.vis_counts = torch.zeros(num_gaussians, device=self.device)
+
+            # Resize if number of Gaussians changed (e.g., after densification)
+            if self.xys_grad_norm.shape[0] != num_gaussians:
+                new_xys_grad_norm = torch.zeros(num_gaussians, device=self.device)
+                new_vis_counts = torch.zeros(num_gaussians, device=self.device)
+                # Copy old values for existing Gaussians
+                n = min(self.xys_grad_norm.shape[0], num_gaussians)
+                new_xys_grad_norm[:n] = self.xys_grad_norm[:n]
+                new_vis_counts[:n] = self.vis_counts[:n]
+                self.xys_grad_norm = new_xys_grad_norm
+                self.vis_counts = new_vis_counts
+
+            # Update gradient tracking using index_add for visible Gaussians
+            # This accumulates gradients for each Gaussian across training steps
+            self.xys_grad_norm.index_add_(0, gs_ids, grads)
+            self.vis_counts.index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32))
 
             # update the max screen size, as a ratio of number of pixels
             if self.max_2Dsize is None:
-                self.max_2Dsize = torch.zeros_like(self.radii, dtype=torch.float32)
-            newradii = self.radii.detach()[visible_mask]
-            self.max_2Dsize[visible_mask] = torch.maximum(
-                self.max_2Dsize[visible_mask],
-                newradii / float(max(self.last_size[0], self.last_size[1])),
+                self.max_2Dsize = torch.zeros(num_gaussians, device=self.device)
+            if self.max_2Dsize.shape[0] != num_gaussians:
+                new_max_2Dsize = torch.zeros(num_gaussians, device=self.device)
+                n = min(self.max_2Dsize.shape[0], num_gaussians)
+                new_max_2Dsize[:n] = self.max_2Dsize[:n]
+                self.max_2Dsize = new_max_2Dsize
+
+            # Update max 2D size for visible Gaussians
+            # Normalize radii to [0, 1] screen space
+            self.max_2Dsize[gs_ids] = torch.maximum(
+                self.max_2Dsize[gs_ids],
+                radii_sel / float(max(H, W)),
             )
 
     def set_crop(self, crop_box: Optional[OrientedBox]):
@@ -708,9 +767,13 @@ class GemSplatModel(SplatfactoModel):
             if do_densification:
                 # then we densify
                 assert self.xys_grad_norm is not None and self.vis_counts is not None and self.max_2Dsize is not None
-                avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
+                # Gradients are already scaled by W/2 and H/2 in after_train() (following gsplat's DefaultStrategy)
+                # So we just need to compute average gradient norm per Gaussian
+                avg_grad_norm = self.xys_grad_norm / self.vis_counts.clamp_min(1)
                 high_grads = (avg_grad_norm > self.config.densify_grad_thresh).squeeze()
                 splits = (self.scales.exp().max(dim=-1).values > self.config.densify_size_thresh).squeeze()
+                if self.step % 1000 == 0:
+                    print(f"[DENSIFY] step {self.step}: high_grads={high_grads.sum().item()}, num_gaussians={self.num_points}")
                 if self.step < self.config.stop_screen_size_at:
                     splits |= (self.max_2Dsize > self.config.split_screen_size).squeeze()
                 splits &= high_grads
@@ -1129,14 +1192,11 @@ class GemSplatModel(SplatfactoModel):
             print("Called get_outputs with not a camera")
             return {}
         assert camera.shape[0] == 1, "Only one camera at a time"
-        
-        try:
-            # Important to allow xys grads to populate properly
-            if self.training:
-                if self.xys.grad is None:
-                    self.xys.grad = torch.zeros_like(self.xys)
-        except:
-            pass
+
+        # Initialize info for gradient tracking (will be set by main rasterization)
+        self.info = None
+
+        # Note: xys gradients are now tracked via info["means2d"].absgrad in new gsplat API
     
         # get the background color
         if self.training:
@@ -1167,7 +1227,7 @@ class GemSplatModel(SplatfactoModel):
                 clip = None
                     
                 return {"rgb": rgb, "depth": depth, "clip": clip,
-                        "accumulation": accumulation, "background": background}
+                        "sel_idx": None, "accumulation": accumulation, "background": background}
         else:
             crop_ids = None
         camera_downscale = self._get_downscale_factor()
@@ -1232,8 +1292,8 @@ class GemSplatModel(SplatfactoModel):
         
         # Do a dummy rasterization pass to get projection info
         # This is a workaround since the new API doesn't expose projection info separately
-        dummy_colors = torch.ones((means_crop.shape[0], 1, 3), device=self.device)
-        dummy_opacities = torch.ones((means_crop.shape[0], 1), device=self.device)
+        dummy_colors = torch.ones((1, means_crop.shape[0], 3), device=self.device)
+        dummy_opacities = torch.ones((means_crop.shape[0],), device=self.device)
         
         with torch.no_grad():
             _, _, info = rasterization(
@@ -1242,7 +1302,7 @@ class GemSplatModel(SplatfactoModel):
                 scales=torch.exp(scales_crop),
                 opacities=dummy_opacities,
                 colors=dummy_colors,
-                viewmats=torch.linalg.inv(viewmat),
+                viewmats=viewmat[None],
                 Ks=K[None],
                 width=W,
                 height=H,
@@ -1255,18 +1315,10 @@ class GemSplatModel(SplatfactoModel):
         depths = means_crop[:, 2]
         self.xys = torch.zeros((means_crop.shape[0], 2), device=self.device)
         
-        if info.get("num_tiles_hit", 0) == 0:
-            rgb = background.repeat(H, W, 1)
-            depth = background.new_ones(*rgb.shape[:2], 1) * 10
-            accumulation = background.new_zeros(*rgb.shape[:2], 1)
-            clip = None
+        # Note: Removed early return based on dummy rasterization's num_tiles_hit.
+        # The main rasterization will handle empty cases properly and we need its info dict for gradient tracking.
 
-            return {"rgb": rgb, "depth": depth, "clip": clip,
-                    "accumulation": accumulation, "background": background}
-
-        # Important to allow xys grads to populate properly
-        if self.training:
-            self.xys.retain_grad()
+        # Note: xys gradients are now tracked via info["means2d"].absgrad in new gsplat API
 
         if self.config.sh_degree > 0:
             viewdirs = means_crop.detach() - optimized_camera_to_world.detach()[:3, 3]  # (N, 3)
@@ -1287,22 +1339,36 @@ class GemSplatModel(SplatfactoModel):
         else:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
+        opacities = opacities.squeeze(-1)  # (N, 1) -> (N,) for gsplat rasterization API
+
         # Render RGB using the unified rasterization API
-        rgb, alpha = rasterization(
+        rgb, alpha, self.info = rasterization(
             means=self.means_crop,
             quats=self.quats_norm,
             scales=self.scales_exp_crop,
             opacities=opacities,
-            colors=rgbs[:, None, :],  # Add color dimension for rasterization
-            viewmats=torch.linalg.inv(self.viewmat),
+            colors=rgbs[None, :, :],  # Shape (C, N, 3) for rasterization
+            viewmats=self.viewmat[None],
             Ks=self.K[None],
             width=self.W,
             height=self.H,
-            backgrounds=background,
-            packed=True,
-        )[:2]  # Get first two outputs (colors and alphas)
-        
-        alpha = alpha[..., None]
+            backgrounds=background[None],  # Shape (C, 3) for rasterization
+            packed=False,  # Use non-packed mode for proper gradient tracking
+            absgrad=True,  # Enable absolute gradient tracking for densification
+        )
+
+        # Update radii from rasterization info for densification
+        if "radii" in self.info:
+            self.radii = self.info["radii"]
+
+        # CRITICAL: Retain gradients on means2d for absgrad to work
+        # This must be called before backward pass
+        if self.training and "means2d" in self.info:
+            self.info["means2d"].retain_grad()
+
+        # Remove batch dimension from rasterization output (C=1)
+        rgb = rgb.squeeze(0)  # (1, H, W, 3) -> (H, W, 3)
+        alpha = alpha.squeeze(0)  # (1, H, W, 1) -> (H, W, 1)
         rgb = torch.clamp(rgb, max=1.0)  # type: ignore
         depth_im = None
         if self.config.output_depth_during_training or not self.training:
@@ -1312,15 +1378,17 @@ class GemSplatModel(SplatfactoModel):
                 quats=self.quats_norm,
                 scales=self.scales_exp_crop,
                 opacities=opacities,
-                colors=depths[:, None].repeat(1, 3),  # Use depth as color for depth map
-                viewmats=torch.linalg.inv(self.viewmat),
+                colors=depths[None, :, None].repeat(1, 1, 3),  # Shape (C, N, 3) for depth map
+                viewmats=self.viewmat[None],
                 Ks=self.K[None],
                 width=self.W,
                 height=self.H,
-                backgrounds=torch.zeros(3, device=self.device),
+                backgrounds=torch.zeros(1, 3, device=self.device),  # Shape (C, 3)
                 packed=True,
             )[:2]
-            
+
+            # Remove batch dimension and extract depth channel
+            depth_render = depth_render.squeeze(0)  # (1, H, W, 3) -> (H, W, 3)
             depth_im = depth_render[..., 0:1]
             depth_im = torch.where(alpha > 0, depth_im / alpha, depth_im.detach().max())
         
@@ -1431,7 +1499,7 @@ class GemSplatModel(SplatfactoModel):
             gt_img = gt_img * mask
             pred_img = pred_img * mask
             
-        if torch.any(torch.isnan(outputs["clip"])) or torch.any(torch.isinf(outputs["clip"])):
+        if outputs["clip"] is not None and (torch.any(torch.isnan(outputs["clip"])) or torch.any(torch.isinf(outputs["clip"]))):
             raise ValueError('NaN or Inf. Detected!')
             
         if outputs["sel_idx"] is not None:
