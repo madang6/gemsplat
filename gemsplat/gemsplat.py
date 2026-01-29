@@ -463,6 +463,19 @@ class GemSplatModel(SplatfactoModel):
             }
         )
 
+        # Compute scene bounds for hash grid normalization
+        # The hash grid expects inputs in [0, 1]³, but scene coordinates are typically in [-1, 1]³
+        # We compute bounds from initial seed points with padding for safety
+        with torch.no_grad():
+            scene_min = means.data.min(dim=0).values
+            scene_max = means.data.max(dim=0).values
+            scene_extent = scene_max - scene_min
+            # Add 10% padding to handle points slightly outside initial bounds
+            padding = scene_extent * 0.1
+            self.register_buffer("scene_aabb_min", scene_min - padding)
+            self.register_buffer("scene_aabb_max", scene_max + padding)
+            CONSOLE.log(f"Scene AABB for hash grid: min={self.scene_aabb_min.tolist()}, max={self.scene_aabb_max.tolist()}")
+
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
@@ -1173,8 +1186,32 @@ class GemSplatModel(SplatfactoModel):
         point = cam_pose @ cam_pcd_points.view(-1, 4).T
         point = point.T.view(*cam_pcd_points.shape[:2], 4)
         point = point[..., :3].view(*depth.shape[:2], 3)
-        
+
         return point
+
+    def normalize_points_for_hashgrid(self, points: torch.Tensor) -> torch.Tensor:
+        """Normalize 3D points from scene coordinates to [0, 1]³ for hash grid encoding.
+
+        The tinycudann HashGrid expects input coordinates in [0, 1]³. This method
+        transforms points from the scene's coordinate system (typically [-1, 1]³ after
+        nerfstudio normalization) to the expected [0, 1]³ range.
+
+        Args:
+            points: Input points in scene coordinates, shape (..., 3)
+
+        Returns:
+            Normalized points in [0, 1]³, clamped to valid range
+        """
+        # Normalize using pre-computed scene bounds
+        aabb_extent = self.scene_aabb_max - self.scene_aabb_min
+        # Avoid division by zero for degenerate dimensions
+        aabb_extent = torch.clamp(aabb_extent, min=1e-6)
+
+        normalized = (points - self.scene_aabb_min) / aabb_extent
+        # Clamp to [0, 1] to handle any points outside the AABB
+        normalized = torch.clamp(normalized, 0.0, 1.0)
+
+        return normalized
 
     def get_outputs(self, camera: Cameras,
                     compute_semantics: Optional[bool] = True) -> Dict[str, Union[torch.Tensor, List]]:
@@ -1413,12 +1450,18 @@ class GemSplatModel(SplatfactoModel):
             
             # selected points
             sel_pcd_points = pcd_points.view(-1, 3)[sel_idx]
-            
+
+            # Normalize points to [0, 1]³ for hash grid encoding
+            sel_pcd_points_normalized = self.normalize_points_for_hashgrid(sel_pcd_points)
+
             # predicted CLIP embeddings
-            clip_im = self.clip_field(sel_pcd_points).float()
+            clip_im = self.clip_field(sel_pcd_points_normalized).float()
         elif compute_semantics:
+            # Normalize points to [0, 1]³ for hash grid encoding
+            pcd_points_normalized = self.normalize_points_for_hashgrid(pcd_points.view(-1, 3))
+
             # predicted CLIP embeddings
-            clip_im = self.clip_field(pcd_points.view(-1, 3)).view(*depth_im.shape[:2], self.clip_embeds_input_dim).float()
+            clip_im = self.clip_field(pcd_points_normalized).view(*depth_im.shape[:2], self.clip_embeds_input_dim).float()
         
         # rescale the camera back to original dimensions before returning
         camera.rescale_output_resolution(camera_downscale)
