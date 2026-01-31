@@ -1,5 +1,6 @@
 # from Nerfstudio GSplat
 import math
+import inspect
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -13,6 +14,12 @@ from gsplat.cuda._wrapper import (
     rasterize_to_pixels,
     spherical_harmonics,
 )
+
+# Detect gsplat version for backwards compatibility
+# gsplat >= 1.5.0 uses n_images/image_ids and returns batch_ids
+# gsplat < 1.5.0 uses n_cameras/camera_ids without batch_ids
+_isect_tiles_params = inspect.signature(isect_tiles).parameters
+_GSPLAT_NEW_API = "n_images" in _isect_tiles_params
 
 
 def rasterization(
@@ -243,15 +250,28 @@ def rasterization(
 
     if packed:
         # The results are packed into shape [nnz, ...]. All elements are valid.
-        (
-            camera_ids,
-            gaussian_ids,
-            radii,
-            means2d,
-            depths,
-            conics,
-            compensations,
-        ) = proj_results
+        # gsplat >= 1.5.0 returns batch_ids as first element
+        if _GSPLAT_NEW_API:
+            (
+                _batch_ids,  # unused in single-batch case
+                camera_ids,
+                gaussian_ids,
+                radii,
+                means2d,
+                depths,
+                conics,
+                compensations,
+            ) = proj_results
+        else:
+            (
+                camera_ids,
+                gaussian_ids,
+                radii,
+                means2d,
+                depths,
+                conics,
+                compensations,
+            ) = proj_results
         opacities = opacities[gaussian_ids]  # [nnz]
     else:
         # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
@@ -265,18 +285,33 @@ def rasterization(
     # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))
     tile_height = math.ceil(height / float(tile_size))
-    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
-        means2d,
-        radii,
-        depths,
-        tile_size,
-        tile_width,
-        tile_height,
-        packed=packed,
-        n_cameras=C,
-        camera_ids=camera_ids,
-        gaussian_ids=gaussian_ids,
-    )
+    # gsplat >= 1.5.0 uses n_images/image_ids, older versions use n_cameras/camera_ids
+    if _GSPLAT_NEW_API:
+        tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+            means2d,
+            radii,
+            depths,
+            tile_size,
+            tile_width,
+            tile_height,
+            packed=packed,
+            n_images=C,
+            image_ids=camera_ids,
+            gaussian_ids=gaussian_ids,
+        )
+    else:
+        tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+            means2d,
+            radii,
+            depths,
+            tile_size,
+            tile_width,
+            tile_height,
+            packed=packed,
+            n_cameras=C,
+            camera_ids=camera_ids,
+            gaussian_ids=gaussian_ids,
+        )
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
     # TODO: SH also suport N-D.
