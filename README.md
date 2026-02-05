@@ -1,4 +1,4 @@
-# GEMSPLAT: Guassian Splatting with Language-Conditioned Semantic Overlay
+# GEMSPLAT: Gaussian Splatting with Language-Conditioned Semantic Overlay
 ## This repo implements Gaussian Splatting with knowledge distillation from the vision-language model CLIP to extract semantic information of the scene.
 
 ## Installation Instructions
