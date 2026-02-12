@@ -15,36 +15,31 @@
 # limitations under the License.
 
 """
-NeRF implementation that combines many recent advancements.
+Gaussian Splatting implementation that combines many recent advancements.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
 from gsplat.rendering import rasterization
-from gsplat import spherical_harmonics
+from gsplat.utils import normalized_quat_to_rotmat
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
-from typing_extensions import Literal
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
-
-# need following import for background color override
-from nerfstudio.model_components import renderers
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
+from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
-
-from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
 
 from gemsplat.encoders.image_encoder import BaseImageEncoder
 from gemsplat.data.gemsplat_datamanager import GemSplatDataManager
@@ -61,61 +56,6 @@ try:
     import tinycudann as tcnn
 except ImportError:
     pass
-
-import time
-
-
-def normalized_quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
-    """Convert a normalized quaternion to a rotation matrix.
-    
-    Args:
-        quat: Quaternion tensor of shape (..., 4) with components [w, x, y, z]
-    
-    Returns:
-        Rotation matrix of shape (..., 3, 3)
-    """
-    assert quat.shape[-1] == 4, quat.shape
-    w, x, y, z = torch.unbind(quat, dim=-1)
-    mat = torch.stack(
-        [
-            1 - 2 * (y**2 + z**2),
-            2 * (x * y - w * z),
-            2 * (x * z + w * y),
-            2 * (x * y + w * z),
-            1 - 2 * (x**2 + z**2),
-            2 * (y * z - w * x),
-            2 * (x * z - w * y),
-            2 * (y * z + w * x),
-            1 - 2 * (x**2 + y**2),
-        ],
-        dim=-1,
-    )
-    return mat.reshape(quat.shape[:-1] + (3, 3))
-
-
-def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
-    """Convert a quaternion to a rotation matrix by normalizing first.
-    
-    Args:
-        quat: Quaternion tensor of shape (..., 4)
-    
-    Returns:
-        Rotation matrix of shape (..., 3, 3)
-    """
-    assert quat.shape[-1] == 4, quat.shape
-    return normalized_quat_to_rotmat(torch.nn.functional.normalize(quat, dim=-1))
-
-
-def num_sh_bases(degree: int) -> int:
-    """Compute the number of spherical harmonics bases for a given degree.
-    
-    Args:
-        degree: The degree of spherical harmonics
-    
-    Returns:
-        Number of SH bases = (degree + 1)^2
-    """
-    return (degree + 1) ** 2
 
 
 def random_quat_tensor(N):
@@ -151,105 +91,56 @@ def SH2RGB(sh):
     C0 = 0.28209479177387814
     return sh * C0 + 0.5
 
-    
-class Autoencoder(torch.nn.Module):
-    '''
-    Autoencoder Class
-    '''
-    def __init__(self, input_dim, latent_dim, layer_sizes=None):
-        super(Autoencoder, self).__init__()
-        
-        # encoder
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, 1024),
-            torch.nn.ReLU(),
-            torch.nn.Linear(1024, 1024),
-            torch.nn.ReLU(),
-            torch.nn.Linear(1024, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, latent_dim)
-        )
-        
-        # decoder
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(latent_dim, 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 1024),
-            torch.nn.ReLU(),
-            torch.nn.Linear(1024, 1024),
-            torch.nn.ReLU(),
-            torch.nn.Linear(1024, input_dim)
-        )
-        
-    def forward(self, x):
-        # encode inputs
-        x = self.encoder(x)
-        
-        # decode latent inputs
-        x = self.decoder(x)
-        
-        return x 
+
+def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
+    """Convert quaternion to rotation matrix (normalizes first)."""
+    quat_normalized = torch.nn.functional.normalize(quat, p=2, dim=-1)
+    return normalized_quat_to_rotmat(quat_normalized)
 
 
-    
-class CNN(torch.nn.Module):
-    '''
-    CNN Class
-    '''
-    def __init__(self, num_channels=3, layer_sizes=None):
-        super(CNN, self).__init__()
-        
-        # CNN
-        # conv. net
-        self.conv_net = torch.nn.Sequential(
-            torch.nn.Conv2d(num_channels, 6, 5, padding=2),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(5, 1, padding=2),
-            torch.nn.Conv2d(6, 16, 5, padding=2),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(5, 1, padding=2)
-        )
-        
-        # fully-connected network
-        self.fc_net = torch.nn.Sequential(
-            torch.nn.Linear(16, 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, 1024)
-        )
-        
-    def forward(self, x):
-        # input dimension
-        spatial_dim = torch.tensor(x.shape)
-        
-        # conv. net
-        x = self.conv_net(x)
-        
-        # flatten
-        x = x.moveaxis(1, -1)
-        
-        # fully-connected network
-        x = self.fc_net(x)
-        
-        x = x.moveaxis(-1, 1)
-        
-        return x 
-    
+def num_sh_bases(degree: int) -> int:
+    """Number of SH bases for a given degree: (degree + 1)^2"""
+    return (degree + 1) ** 2
+
+
+def resize_image(image: torch.Tensor, d: int):
+    """
+    Downscale images using the same 'area' method in opencv
+
+    :param image shape [H, W, C]
+    :param d downscale factor (must be 2, 4, 8, etc.)
+
+    return downscaled image in shape [H//d, W//d, C]
+    """
+    import torch.nn.functional as tf
+
+    image = image.to(torch.float32)
+    weight = (1.0 / (d * d)) * torch.ones((1, 1, d, d), dtype=torch.float32, device=image.device)
+    return tf.conv2d(image.permute(2, 0, 1)[:, None, ...], weight, stride=d).squeeze(1).permute(1, 2, 0)
+
+
+@torch_compile()
+def get_viewmat(optimized_camera_to_world):
+    """
+    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    """
+    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
+    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.transpose(1, 2)
+    T_inv = -torch.bmm(R_inv, T)
+    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
+    viewmat[:, 3, 3] = 1.0  # homogenous
+    viewmat[:, :3, :3] = R_inv
+    viewmat[:, :3, 3:4] = T_inv
+    return viewmat
+
 
 @dataclass
-class GemSplatModelConfig(SplatfactoModelConfig):
-    """Splatfacto Model Config, nerfstudio's implementation of Gaussian Splatting"""
+class GemSplatModelConfig(ModelConfig):
+    """GemSplat Model Config, nerfstudio's implementation of Gaussian Splatting"""
 
     _target: Type = field(default_factory=lambda: GemSplatModel)
     warmup_length: int = 500
@@ -270,7 +161,7 @@ class GemSplatModelConfig(SplatfactoModelConfig):
     """If True, continue to cull gaussians post refinement"""
     reset_alpha_every: int = 30
     """Every this many refinement steps, reset the alpha"""
-    densify_grad_thresh: float = 0.0002
+    densify_grad_thresh: float = 0.0008
     """threshold of positional gradient norm for densifying gaussians"""
     densify_size_thresh: float = 0.01
     """below this size, gaussians are *duplicated*, otherwise split"""
@@ -316,6 +207,8 @@ class GemSplatModelConfig(SplatfactoModelConfig):
     """
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="off"))
     """Config of the camera optimizer to use"""
+    enable_clip_mask: bool = False
+    """Option to utilize the alpha channel as a mask for CLIP distillation."""
     semantics_batch_size: int = 1
     """The batch size for training the semantic field."""
     output_semantics_during_training: bool = False
@@ -349,15 +242,15 @@ class GemSplatModelConfig(SplatfactoModelConfig):
     hashgrid_sizes: Tuple[int, int] = (19, 19)
 
 
-class GemSplatModel(SplatfactoModel):
+class GemSplatModel(Model):
     """Nerfstudio's implementation of Gaussian Splatting
 
     Args:
-        config: Splatfacto configuration to instantiate model
+        config: GemSplat configuration to instantiate model
     """
 
     config: GemSplatModelConfig
-
+    
     def __init__(
         self,
         *args,
@@ -459,27 +352,14 @@ class GemSplatModel(SplatfactoModel):
                 "quats": quats,
                 "features_dc": features_dc,
                 "features_rest": features_rest,
-                "opacities": opacities
+                "opacities": opacities,
             }
         )
-
-        # Compute scene bounds for hash grid normalization
-        # The hash grid expects inputs in [0, 1]³, but scene coordinates are typically in [-1, 1]³
-        # We compute bounds from initial seed points with padding for safety
-        with torch.no_grad():
-            scene_min = means.data.min(dim=0).values
-            scene_max = means.data.max(dim=0).values
-            scene_extent = scene_max - scene_min
-            # Add 10% padding to handle points slightly outside initial bounds
-            padding = scene_extent * 0.1
-            self.register_buffer("scene_aabb_min", scene_min - padding)
-            self.register_buffer("scene_aabb_max", scene_max + padding)
-            CONSOLE.log(f"Scene AABB for hash grid: min={self.scene_aabb_min.tolist()}, max={self.scene_aabb_max.tolist()}")
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
-        
+
         # metrics
         from torchmetrics.image import PeakSignalNoiseRatio
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
@@ -496,7 +376,7 @@ class GemSplatModel(SplatfactoModel):
             )  # This color is the same as the default background color in Viser. This would only affect the background color when rendering.
         else:
             self.background_color = get_color(self.config.background_color)
-            
+         
         if self.config.enable_sparsification:
             # the weight on the sparsity-inducing component in the loss function
             self.sparsity_weight = self.config.sparsity_weight_init
@@ -671,88 +551,24 @@ class GemSplatModel(SplatfactoModel):
         # to save some training time, we no longer need to update those stats post refinement
         if self.step >= self.config.stop_split_at:
             return
-
         with torch.no_grad():
-            # Check if we have the necessary info from rasterization
-            if not hasattr(self, 'info') or self.info is None:
-                return
-            if "radii" not in self.info or "means2d" not in self.info:
-                return
-
-            means2d = self.info["means2d"]
-
-            # Get 2D gradients from means2d - use absgrad if available (set by gsplat when absgrad=True)
-            # Fall back to .grad if absgrad not available
-            if hasattr(means2d, 'absgrad') and means2d.absgrad is not None:
-                grads_2d = means2d.absgrad.clone()  # [C, N, 2] for packed=False
-            elif means2d.grad is not None:
-                grads_2d = means2d.grad.clone()  # [C, N, 2] for packed=False
-            else:
-                # No gradients available - this is the problematic case
-                # Debug: print warning on first occurrence
-                if not hasattr(self, '_warned_no_grad'):
-                    print(f"[WARNING] means2d has no absgrad or grad at step {step}. Densification will be impaired.")
-                    self._warned_no_grad = True
-                return
-
-            # With packed=False, radii is [C, N] where C=1, grads_2d is [C, N, 2]
-            radii = self.info["radii"]  # [C, N]
-            H, W = self.last_size
-
-            # Select visible Gaussians (radii > 0)
-            # For packed=False mode: radii is [C, N], grads_2d is [C, N, 2]
-            sel = radii > 0.0  # [C, N]
-            gs_ids = torch.where(sel)[1]  # [nnz] - indices of visible Gaussians
-            grads_2d = grads_2d[sel]  # [nnz, 2]
-            radii_sel = radii[sel]  # [nnz]
-
-            # Normalize gradients to [-1, 1] screen space (following DefaultStrategy)
-            # This is what gsplat's DefaultStrategy does in _update_state
-            n_cameras = 1  # We render one camera at a time
-            grads_2d[..., 0] *= W / 2.0 * n_cameras
-            grads_2d[..., 1] *= H / 2.0 * n_cameras
-
-            # Compute gradient norm
-            grads = grads_2d.norm(dim=-1)  # [nnz]
-
-            # Number of total Gaussians
-            num_gaussians = self.num_points
-
-            # Initialize tracking tensors for all Gaussians if needed
+            # keep track of a moving average of grad norms
+            visible_mask = (self.radii > 0).all(dim=-1)
+            grads = self.xys.absgrad[0][visible_mask].norm(dim=-1)  # type: ignore
+            # print(f"grad norm min {grads.min().item()} max {grads.max().item()} mean {grads.mean().item()} size {grads.shape}")
             if self.xys_grad_norm is None:
-                self.xys_grad_norm = torch.zeros(num_gaussians, device=self.device)
-                self.vis_counts = torch.zeros(num_gaussians, device=self.device)
-
-            # Resize if number of Gaussians changed (e.g., after densification)
-            if self.xys_grad_norm.shape[0] != num_gaussians:
-                new_xys_grad_norm = torch.zeros(num_gaussians, device=self.device)
-                new_vis_counts = torch.zeros(num_gaussians, device=self.device)
-                # Copy old values for existing Gaussians
-                n = min(self.xys_grad_norm.shape[0], num_gaussians)
-                new_xys_grad_norm[:n] = self.xys_grad_norm[:n]
-                new_vis_counts[:n] = self.vis_counts[:n]
-                self.xys_grad_norm = new_xys_grad_norm
-                self.vis_counts = new_vis_counts
-
-            # Update gradient tracking using index_add for visible Gaussians
-            # This accumulates gradients for each Gaussian across training steps
-            self.xys_grad_norm.index_add_(0, gs_ids, grads)
-            self.vis_counts.index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32))
-
+                self.xys_grad_norm = torch.zeros(self.num_points, device=self.device, dtype=torch.float32)
+                self.vis_counts = torch.ones(self.num_points, device=self.device, dtype=torch.float32)
+            assert self.vis_counts is not None
+            self.vis_counts[visible_mask] += 1
+            self.xys_grad_norm[visible_mask] += grads
             # update the max screen size, as a ratio of number of pixels
             if self.max_2Dsize is None:
-                self.max_2Dsize = torch.zeros(num_gaussians, device=self.device)
-            if self.max_2Dsize.shape[0] != num_gaussians:
-                new_max_2Dsize = torch.zeros(num_gaussians, device=self.device)
-                n = min(self.max_2Dsize.shape[0], num_gaussians)
-                new_max_2Dsize[:n] = self.max_2Dsize[:n]
-                self.max_2Dsize = new_max_2Dsize
-
-            # Update max 2D size for visible Gaussians
-            # Normalize radii to [0, 1] screen space
-            self.max_2Dsize[gs_ids] = torch.maximum(
-                self.max_2Dsize[gs_ids],
-                radii_sel / float(max(H, W)),
+                self.max_2Dsize = torch.zeros(self.num_points, device=self.device, dtype=torch.float32)
+            newradii = self.radii.detach()[visible_mask].max(dim=-1).values
+            self.max_2Dsize[visible_mask] = torch.maximum(
+                self.max_2Dsize[visible_mask],
+                newradii / float(max(self.last_size[0], self.last_size[1])),
             )
 
     def set_crop(self, crop_box: Optional[OrientedBox]):
@@ -766,7 +582,6 @@ class GemSplatModel(SplatfactoModel):
         assert step == self.step
         if self.step <= self.config.warmup_length:
             return
-        
         with torch.no_grad():
             # Offset all the opacity reset logic by refine_every so that we don't
             # save checkpoints right when the opacity is reset (saves every 2k)
@@ -780,13 +595,9 @@ class GemSplatModel(SplatfactoModel):
             if do_densification:
                 # then we densify
                 assert self.xys_grad_norm is not None and self.vis_counts is not None and self.max_2Dsize is not None
-                # Gradients are already scaled by W/2 and H/2 in after_train() (following gsplat's DefaultStrategy)
-                # So we just need to compute average gradient norm per Gaussian
-                avg_grad_norm = self.xys_grad_norm / self.vis_counts.clamp_min(1)
+                avg_grad_norm = (self.xys_grad_norm / self.vis_counts) * 0.5 * max(self.last_size[0], self.last_size[1])
                 high_grads = (avg_grad_norm > self.config.densify_grad_thresh).squeeze()
                 splits = (self.scales.exp().max(dim=-1).values > self.config.densify_size_thresh).squeeze()
-                if self.step % 1000 == 0:
-                    print(f"[DENSIFY] step {self.step}: high_grads={high_grads.sum().item()}, num_gaussians={self.num_points}")
                 if self.step < self.config.stop_screen_size_at:
                     splits |= (self.max_2Dsize > self.config.split_screen_size).squeeze()
                 splits &= high_grads
@@ -800,7 +611,6 @@ class GemSplatModel(SplatfactoModel):
                     self.gauss_params[name] = torch.nn.Parameter(
                         torch.cat([param.detach(), split_params[name], dup_params[name]], dim=0)
                     )
-
                 # append zeros to the max_2Dsize tensor
                 self.max_2Dsize = torch.cat(
                     [
@@ -874,8 +684,8 @@ class GemSplatModel(SplatfactoModel):
             toobigs = (torch.exp(self.scales).max(dim=-1).values > self.config.cull_scale_thresh).squeeze()
             if self.step < self.config.stop_screen_size_at:
                 # cull big screen space
-                assert self.max_2Dsize is not None
-                toobigs = toobigs | (self.max_2Dsize > self.config.cull_screen_size).squeeze()
+                if self.max_2Dsize is not None:
+                    toobigs = toobigs | (self.max_2Dsize > self.config.cull_screen_size).squeeze()
             culls = culls | toobigs
             toobigs_count = torch.sum(toobigs).item()
         for name, param in self.gauss_params.items():
@@ -913,7 +723,6 @@ class GemSplatModel(SplatfactoModel):
         self.scales[split_mask] = torch.log(torch.exp(self.scales[split_mask]) / size_fac)
         # step 5, sample new quats
         new_quats = self.quats[split_mask].repeat(samps, 1)
-        
         out = {
             "means": new_means,
             "features_dc": new_features_dc,
@@ -997,19 +806,32 @@ class GemSplatModel(SplatfactoModel):
     def _downscale_if_required(self, image):
         d = self._get_downscale_factor()
         if d > 1:
-            newsize = [image.shape[0] // d, image.shape[1] // d]
-
-            # torchvision can be slow to import, so we do it lazily.
-            import torchvision.transforms.functional as TF
-
-            return TF.resize(image.permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
+            return resize_image(image, d)
         return image
-        
+
+    @staticmethod
+    def get_empty_outputs(width: int, height: int, background: torch.Tensor) -> Dict[str, Union[torch.Tensor, List]]:
+        rgb = background.repeat(height, width, 1)
+        depth = background.new_ones(*rgb.shape[:2], 1) * 10
+        accumulation = background.new_zeros(*rgb.shape[:2], 1)
+        return {"rgb": rgb, "depth": depth, "accumulation": accumulation, "background": background}
+
+    def _get_background_color(self):
+        if self.config.background_color == "random":
+            if self.training:
+                background = torch.rand(3, device=self.device)
+            else:
+                background = self.background_color.to(self.device)
+        elif self.config.background_color == "white":
+            background = torch.ones(3, device=self.device)
+        elif self.config.background_color == "black":
+            background = torch.zeros(3, device=self.device)
+        else:
+            raise ValueError(f"Unknown background color {self.config.background_color}")
+        return background
+
     @torch.no_grad()
     def get_semantic_outputs(self, outputs: Dict[str, torch.Tensor]):
-        if outputs["clip"] is None:
-            return
-        
         if not self.training:
             # Normalize CLIP features rendered by feature field
             clip_features = outputs["clip"]
@@ -1037,28 +859,6 @@ class GemSplatModel(SplatfactoModel):
                     
                     sims, _ = probs.min(dim=-1, keepdim=True)
                     outputs["similarity"] = sims.reshape((*pos_sims.shape[:-1], 1))
-
-                    outputs["sqrt_similarity"] = ((outputs["similarity"]+1)/2)**(1/2.2)
-
-                    outputs["sigmoid_similarity"] = torch.sigmoid(25*outputs["similarity"])
-                    outputs["sigmoid_similarity"] = apply_colormap(outputs["sigmoid_similarity"],
-                                                                   ColormapOptions("turbo"))
-                    
-                    outputs["logit_similarity"] = torch.clamp((outputs["similarity"] + 1) / 2, 1e-6, 1-1e-6)
-                    outputs["logit_similarity"] = torch.logit(outputs["similarity"])
-                    outputs["logit_similarity"] = apply_colormap(outputs["logit_similarity"],
-                                                                   ColormapOptions("turbo"))
-
-                    outputs["floored_similarity"] = outputs["similarity"].clone()
-                    floored_similarity = torch.sign(outputs["floored_similarity"]) * (outputs["floored_similarity"].abs()) ** (0.3)
-                    outputs["floored_similarity"] = apply_colormap(floored_similarity,
-                                                                ColormapOptions("turbo"))
-
-                    # scaled similarity
-                    sc_sim = torch.clip(outputs["similarity"] - 0.48, 0, 1)
-                    outputs["scaled_similarity"] = sc_sim/(sc_sim.max() + 1e-6)
-                    outputs["scaled_similarity"] = apply_colormap(outputs["scaled_similarity"],
-                                                                   ColormapOptions("turbo"))
                     
                     # cosine similarity
                     outputs["raw_similarity"] = raw_sims[..., :1]
@@ -1071,51 +871,6 @@ class GemSplatModel(SplatfactoModel):
                     if sims.shape[-1] > 1:
                         sims = sims.mean(dim=-1, keepdim=True)
                     outputs["similarity"] = sims
-
-                    outputs["sqrt_similarity"] = ((outputs["similarity"]+1)/2)**(1/2.2)
-
-                    # sigmoid similarity
-                    outputs["sigmoid_similarity"] = torch.sigmoid(25*outputs["similarity"])
-                    outputs["sigmoid_similarity"] = apply_colormap(outputs["sigmoid_similarity"],
-                                                                   ColormapOptions("turbo"))
-
-                    # scaled similarity
-                    sc_sim = torch.clip(outputs["similarity"] - 0.48, 0, 1)
-                    outputs["scaled_similarity"] = sc_sim/(sc_sim.max() + 1e-6)
-                    outputs["scaled_similarity"] = apply_colormap(outputs["scaled_similarity"],
-                                                                   ColormapOptions("turbo"))
-                    # logit similarity
-                    outputs["logit_similarity"] = torch.clamp((outputs["similarity"] + 1) / 2, 1e-6, 1-1e-6)             
-                    outputs["logit_similarity"] = (torch.log(outputs["logit_similarity"])) - torch.log(1 - outputs["logit_similarity"])/0.8#torch.logit(outputs["similarity"])
-                    # print(f"Minimum value in logit_similarity: {outputs['logit_similarity'].min().item()}")    
-                    # print(f"Maximum value in logit_similarity: {outputs['logit_similarity'].max().item()}")
-
-                    outputs["MDS"] = torch.cat(([outputs["rgb"].mean(dim=-1, keepdim=True), outputs["depth"], outputs["logit_similarity"]]), dim=-1)
-                    # outputs["MDS"] = torch.cat(([torch.sum(outputs["rgb"]*torch.tensor([0.2989, 0.5870, 0.1140], device="cuda").view(1,1,3), dim=-1,keepdim=True), outputs["depth"], outputs["logit_similarity"]]), dim=-1)
-                    # outputs["MDS"] = torch.cat(([torch.sum(outputs["rgb"]*torch.tensor([0.2989, 0.5870, 0.1140], device="cuda").view(1,1,3), dim=-1,keepdim=True), outputs["depth"], outputs["similarity"]]), dim=-1)
-
-                    outputs["logit_similarity"] = apply_colormap(outputs["logit_similarity"],
-                                                                   ColormapOptions("turbo"))
-
-                    outputs["floored_similarity"] = outputs["similarity"].clone()
-                    # outputs["floored_similarity"][-10:, -10:] = -1.0  # Change a small patch of pixels to the lowest possible value
-                    # fl_sim = torch.clip(outputs["floored_similarity"] - 0.48, 0, 1)
-                    # fl_sim = outputs["floored_similarity"]
-                    # fl_sim = fl_sim/(fl_sim.max() + 1e-6)
-                    # outputs["floored_similarity"] = fl_sim
-                    # outputs["floored_similarity"] = apply_colormap(fl_sim,
-                    #                                               ColormapOptions("turbo"))
-                    # print(f"Minimum value in floored_similarity: {outputs['floored_similarity'].min().item()}")
-                    # outputs["floored_similarity"] = ((outputs["floored_similarity"]+1)/2)**(1/2.0)
-                    floored_similarity = torch.sign(outputs["floored_similarity"]) * (outputs["floored_similarity"].abs()) ** (0.2)
-                    # floored_similarity = torch.sigmoid(outputs["floored_similarity"])
-                    # floored_similarity = outputs["floored_similarity"]
-                    # floored_similarity = floored_similarity - floored_similarity.min()
-                    # floored_similarity /= (floored_similarity.max() + 1e-10)
-                    # floored_similarity /= (floored_similarity.max() - floored_similarity.min() + 1e-10)
-                    outputs["floored_similarity"] = apply_colormap(floored_similarity,
-                                                                ColormapOptions("turbo"))
-                    # outputs["floored_similarity"] = apply_colormap(floored_similarity, ColormapOptions("turbo"))
                     
                     # cosine similarity
                     outputs["raw_similarity"] = sims
@@ -1124,7 +879,7 @@ class GemSplatModel(SplatfactoModel):
                 similarity_clip = outputs[f"similarity"] - outputs[f"similarity"].min()
                 similarity_clip /= (similarity_clip.max() + 1e-10)
                 outputs["similarity_GUI"] = apply_colormap(similarity_clip,
-                                                        ColormapOptions("turbo"))
+                                                           ColormapOptions("turbo"))
                 
             if "rgb" in outputs.keys():
                 if self.viewer_utils.has_positives:
@@ -1186,32 +941,8 @@ class GemSplatModel(SplatfactoModel):
         point = cam_pose @ cam_pcd_points.view(-1, 4).T
         point = point.T.view(*cam_pcd_points.shape[:2], 4)
         point = point[..., :3].view(*depth.shape[:2], 3)
-
+        
         return point
-
-    def normalize_points_for_hashgrid(self, points: torch.Tensor) -> torch.Tensor:
-        """Normalize 3D points from scene coordinates to [0, 1]³ for hash grid encoding.
-
-        The tinycudann HashGrid expects input coordinates in [0, 1]³. This method
-        transforms points from the scene's coordinate system (typically [-1, 1]³ after
-        nerfstudio normalization) to the expected [0, 1]³ range.
-
-        Args:
-            points: Input points in scene coordinates, shape (..., 3)
-
-        Returns:
-            Normalized points in [0, 1]³, clamped to valid range
-        """
-        # Normalize using pre-computed scene bounds
-        aabb_extent = self.scene_aabb_max - self.scene_aabb_min
-        # Avoid division by zero for degenerate dimensions
-        aabb_extent = torch.clamp(aabb_extent, min=1e-6)
-
-        normalized = (points - self.scene_aabb_min) / aabb_extent
-        # Clamp to [0, 1] to handle any points outside the AABB
-        normalized = torch.clamp(normalized, 0.0, 1.0)
-
-        return normalized
 
     def get_outputs(self, camera: Cameras,
                     compute_semantics: Optional[bool] = True) -> Dict[str, Union[torch.Tensor, List]]:
@@ -1228,65 +959,22 @@ class GemSplatModel(SplatfactoModel):
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
-        assert camera.shape[0] == 1, "Only one camera at a time"
 
-        # Initialize info for gradient tracking (will be set by main rasterization)
-        self.info = None
-
-        # Note: xys gradients are now tracked via info["means2d"].absgrad in new gsplat API
-    
-        # get the background color
         if self.training:
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)[0, ...]
-
-            if self.config.background_color == "random":
-                background = torch.rand(3, device=self.device)
-            elif self.config.background_color == "white":
-                background = torch.ones(3, device=self.device)
-            elif self.config.background_color == "black":
-                background = torch.zeros(3, device=self.device)
-            else:
-                background = self.background_color.to(self.device)
+            assert camera.shape[0] == 1, "Only one camera at a time"
+            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
         else:
-            optimized_camera_to_world = camera.camera_to_worlds[0, ...]
+            optimized_camera_to_world = camera.camera_to_worlds
 
-            if renderers.BACKGROUND_COLOR_OVERRIDE is not None:
-                background = renderers.BACKGROUND_COLOR_OVERRIDE.to(self.device)
-            else:
-                background = self.background_color.to(self.device)
-
+        # cropping
         if self.crop_box is not None and not self.training:
             crop_ids = self.crop_box.within(self.means).squeeze()
             if crop_ids.sum() == 0:
-                rgb = background.repeat(int(camera.height.item()), int(camera.width.item()), 1)
-                depth = background.new_ones(*rgb.shape[:2], 1) * 10
-                accumulation = background.new_zeros(*rgb.shape[:2], 1)
-                clip = None
-                    
-                return {"rgb": rgb, "depth": depth, "clip": clip,
-                        "sel_idx": None, "accumulation": accumulation, "background": background}
+                return self.get_empty_outputs(
+                    int(camera.width.item()), int(camera.height.item()), self.background_color
+                )
         else:
             crop_ids = None
-        camera_downscale = self._get_downscale_factor()
-        camera.rescale_output_resolution(1 / camera_downscale)
-        # shift the camera to center of scene looking at center
-        R = optimized_camera_to_world[:3, :3]  # 3 x 3
-        T = optimized_camera_to_world[:3, 3:4]  # 3 x 1
-
-        # flip the z and y axes to align with gsplat conventions
-        R_edit = torch.diag(torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype))
-        R = R @ R_edit
-        # analytic matrix inverse to get world2camera matrix
-        R_inv = R.T
-        T_inv = -R_inv @ T
-        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
-        viewmat[:3, :3] = R_inv
-        viewmat[:3, 3:4] = T_inv
-        # calculate the FOV of the camera given fx and fy, width and height
-        cx = camera.cx.item()
-        cy = camera.cy.item()
-        W, H = int(camera.width.item()), int(camera.height.item())
-        self.last_size = (H, W)
 
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
@@ -1304,133 +992,75 @@ class GemSplatModel(SplatfactoModel):
             quats_crop = self.quats
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
+
         BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
-        
-        # Normalize quaternions and prepare camera matrices for new API
-        quats_norm = quats_crop / quats_crop.norm(dim=-1, keepdim=True)
-        
-        # Build K matrix from camera intrinsics
-        K = torch.eye(3, device=self.device, dtype=torch.float32)
-        K[0, 0] = camera.fx.item()
-        K[1, 1] = camera.fy.item()
-        K[0, 2] = cx
-        K[1, 2] = cy
-        
-        # Store camera/rendering info for use in rasterization calls
-        self.means_crop = means_crop
-        self.scales_exp_crop = torch.exp(scales_crop)
-        self.quats_norm = quats_norm
-        self.colors_crop = colors_crop
-        self.viewmat = viewmat
-        self.K = K
-        self.H = H
-        self.W = W
-        self.BLOCK_WIDTH = BLOCK_WIDTH
-        
-        # Do a dummy rasterization pass to get projection info
-        # This is a workaround since the new API doesn't expose projection info separately
-        dummy_colors = torch.ones((1, means_crop.shape[0], 3), device=self.device)
-        dummy_opacities = torch.ones((means_crop.shape[0],), device=self.device)
-        
-        with torch.no_grad():
-            _, _, info = rasterization(
-                means=means_crop,
-                quats=quats_norm,
-                scales=torch.exp(scales_crop),
-                opacities=dummy_opacities,
-                colors=dummy_colors,
-                viewmats=viewmat[None],
-                Ks=K[None],
-                width=W,
-                height=H,
-                packed=True,
-            )
-        
-        # Extract/create projection info from the internal representation
-        # Store dummy values for compatibility with downstream code
-        self.radii = torch.ones(means_crop.shape[0], device=self.device, dtype=torch.int32)
-        depths = means_crop[:, 2]
-        self.xys = torch.zeros((means_crop.shape[0], 2), device=self.device)
-        
-        # Note: Removed early return based on dummy rasterization's num_tiles_hit.
-        # The main rasterization will handle empty cases properly and we need its info dict for gradient tracking.
-
-        # Note: xys gradients are now tracked via info["means2d"].absgrad in new gsplat API
-
-        if self.config.sh_degree > 0:
-            viewdirs = means_crop.detach() - optimized_camera_to_world.detach()[:3, 3]  # (N, 3)
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
-            rgbs = spherical_harmonics(n, viewdirs, colors_crop)
-            rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
-        else:
-            rgbs = torch.sigmoid(colors_crop[:, 0, :])
+        camera_scale_fac = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_scale_fac)
+        viewmat = get_viewmat(optimized_camera_to_world)
+        K = camera.get_intrinsics_matrices().cuda()
+        W, H = int(camera.width.item()), int(camera.height.item())
+        self.last_size = (H, W)
 
         # apply the compensation of screen space blurring to gaussians
-        opacities = None
-        if self.config.rasterize_mode == "antialiased":
-            # Note: comp is no longer provided by new API, use compensation factor of 1.0
-            opacities = torch.sigmoid(opacities_crop)
-        elif self.config.rasterize_mode == "classic":
-            opacities = torch.sigmoid(opacities_crop)
-        else:
+        if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        opacities = opacities.squeeze(-1)  # (N, 1) -> (N,) for gsplat rasterization API
-
-        # Render RGB using the unified rasterization API
-        rgb, alpha, self.info = rasterization(
-            means=self.means_crop,
-            quats=self.quats_norm,
-            scales=self.scales_exp_crop,
-            opacities=opacities,
-            colors=rgbs[None, :, :],  # Shape (C, N, 3) for rasterization
-            viewmats=self.viewmat[None],
-            Ks=self.K[None],
-            width=self.W,
-            height=self.H,
-            backgrounds=background[None],  # Shape (C, 3) for rasterization
-            packed=False,  # Use non-packed mode for proper gradient tracking
-            absgrad=True,  # Enable absolute gradient tracking for densification
-        )
-
-        # Update radii from rasterization info for densification
-        if "radii" in self.info:
-            self.radii = self.info["radii"]
-
-        # CRITICAL: Retain gradients on means2d for absgrad to work
-        # This must be called before backward pass
-        if self.training and "means2d" in self.info:
-            self.info["means2d"].retain_grad()
-
-        # Remove batch dimension from rasterization output (C=1)
-        rgb = rgb.squeeze(0)  # (1, H, W, 3) -> (H, W, 3)
-        alpha = alpha.squeeze(0)  # (1, H, W, 1) -> (H, W, 1)
-        rgb = torch.clamp(rgb, max=1.0)  # type: ignore
-        depth_im = None
         if self.config.output_depth_during_training or not self.training:
-            # Render depth map using depth values as color
-            depth_render, _ = rasterization(
-                means=self.means_crop,
-                quats=self.quats_norm,
-                scales=self.scales_exp_crop,
-                opacities=opacities,
-                colors=depths[None, :, None].repeat(1, 1, 3),  # Shape (C, N, 3) for depth map
-                viewmats=self.viewmat[None],
-                Ks=self.K[None],
-                width=self.W,
-                height=self.H,
-                backgrounds=torch.zeros(1, 3, device=self.device),  # Shape (C, 3)
-                packed=True,
-            )[:2]
+            render_mode = "RGB+ED"
+        else:
+            render_mode = "RGB"
 
-            # Remove batch dimension and extract depth channel
-            depth_render = depth_render.squeeze(0)  # (1, H, W, 3) -> (H, W, 3)
-            depth_im = depth_render[..., 0:1]
-            depth_im = torch.where(alpha > 0, depth_im / alpha, depth_im.detach().max())
-        
+        if self.config.sh_degree > 0:
+            sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+        else:
+            colors_crop = torch.sigmoid(colors_crop)
+            sh_degree_to_use = None
+
+        render, alpha, info = rasterization(
+            means=means_crop,
+            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=colors_crop,
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
+            width=W,
+            height=H,
+            tile_size=BLOCK_WIDTH,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode=render_mode,
+            sh_degree=sh_degree_to_use,
+            sparse_grad=False,
+            absgrad=True,
+            rasterize_mode=self.config.rasterize_mode,
+            # set some threshold to disregrad small gaussians for faster rendering.
+            # radius_clip=3.0,
+        )
+        if self.training and info["means2d"].requires_grad:
+            info["means2d"].retain_grad()
+        self.xys = info["means2d"]  # [1, N, 2]
+        self.radii = info["radii"][0]  # [N, 2] in gsplat 1.4.0 (per-axis radii)
+        alpha = alpha[:, ...]
+
+        background = self._get_background_color()
+        rgb = render[:, ..., :3] + (1 - alpha) * background
+        rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        if render_mode == "RGB+ED":
+            depth_im = render[:, ..., 3:4]
+            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
+        else:
+            depth_im = None
+
+        if background.shape[0] == 3 and not self.training:
+            background = background.expand(H, W, 3)
+
         # generate a point cloud from the depth image
         pcd_points = self.get_point_cloud_from_camera(camera, depth_im.detach().clone())
+        
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
         
         # selected indices and points
         sel_idx = None
@@ -1450,36 +1080,28 @@ class GemSplatModel(SplatfactoModel):
             
             # selected points
             sel_pcd_points = pcd_points.view(-1, 3)[sel_idx]
-
-            # Normalize points to [0, 1]³ for hash grid encoding
-            sel_pcd_points_normalized = self.normalize_points_for_hashgrid(sel_pcd_points)
-
+            
             # predicted CLIP embeddings
-            clip_im = self.clip_field(sel_pcd_points_normalized).float()
+            clip_im = self.clip_field(sel_pcd_points).float()
         elif compute_semantics:
-            # Normalize points to [0, 1]³ for hash grid encoding
-            pcd_points_normalized = self.normalize_points_for_hashgrid(pcd_points.view(-1, 3))
-
             # predicted CLIP embeddings
-            clip_im = self.clip_field(pcd_points_normalized).view(*depth_im.shape[:2], self.clip_embeds_input_dim).float()
+            clip_im = self.clip_field(pcd_points.view(-1, 3)).view(*depth_im.shape[:2], self.clip_embeds_input_dim).float()
         
-        # rescale the camera back to original dimensions before returning
-        camera.rescale_output_resolution(camera_downscale)
-        
-        # outputs
-        outputs = {"rgb": rgb,
-                   "depth": depth_im,
-                   "sel_idx": sel_idx,
-                   "clip": clip_im,
-                   "accumulation": alpha, 
-                   "background": background}  # type: ignore
-        
+        outputs =  {
+            "rgb": rgb.squeeze(0),  # type: ignore
+            "depth": depth_im,  # type: ignore
+            "sel_idx": sel_idx,  # type: ignore
+            "accumulation": alpha.squeeze(0),  # type: ignore
+            "clip": clip_im,  # type: ignore
+            "background": background,  # type: ignore
+        }  # type: ignore
+
         if (self.config.output_semantics_during_training or not self.training) and compute_semantics:
             # Compute semantic inputs, e.g., composited similarity.
             outputs = self.get_semantic_outputs(outputs=outputs)
-            
-        return outputs 
-
+        
+        return outputs
+    
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
 
@@ -1541,8 +1163,8 @@ class GemSplatModel(SplatfactoModel):
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
             gt_img = gt_img * mask
             pred_img = pred_img * mask
-            
-        if outputs["clip"] is not None and (torch.any(torch.isnan(outputs["clip"])) or torch.any(torch.isinf(outputs["clip"]))):
+
+        if torch.any(torch.isnan(outputs["clip"])) or torch.any(torch.isinf(outputs["clip"])):
             raise ValueError('NaN or Inf. Detected!')
             
         if outputs["sel_idx"] is not None:
@@ -1563,6 +1185,14 @@ class GemSplatModel(SplatfactoModel):
             # ground-truth CLIP embeddings
             gt_clip = batch["clip"][sc_y_ind, sc_x_ind, :].float()
             
+            # mask using the alpha channel
+            if self.config.enable_clip_mask:
+                if batch["image"].shape[-1] > 3:
+                    # mask
+                    mask = self.get_gt_img(batch["image"])[..., -1].float()[..., None].reshape(-1, 1)[outputs["sel_idx"]]
+                    pred_clip = pred_clip * mask
+                    gt_clip = gt_clip * mask
+                            
             # Loss: CLIP Embeddings
             clip_img_loss = self.config.clip_img_loss_weight * (
                 torch.nn.functional.mse_loss(pred_clip, gt_clip) 
@@ -1575,11 +1205,10 @@ class GemSplatModel(SplatfactoModel):
         else:
             # Loss: CLIP Embeddings
             clip_img_loss = 0.0
-            
+          
         # RGB-related loss
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
-       
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scale_exp = torch.exp(self.scales)
             scale_reg = (
@@ -1592,7 +1221,7 @@ class GemSplatModel(SplatfactoModel):
             scale_reg = 0.1 * scale_reg.mean()
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
-            
+        
         # main loss
         main_loss = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss + clip_img_loss
          
@@ -1611,23 +1240,22 @@ class GemSplatModel(SplatfactoModel):
             "main_loss": main_loss,
             "scale_reg": scale_reg,
         }
-
+        
         if self.training:
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
-            
+
         return loss_dict
 
     @torch.no_grad()
-    def get_outputs_for_camera(self, camera: Cameras, 
+    def get_outputs_for_camera(self, camera: Cameras,
                                obb_box: Optional[OrientedBox] = None,
                                compute_semantics: Optional[bool] = True) -> Dict[str, torch.Tensor]:
         """Takes in a camera, generates the raybundle, and computes the output of the model.
         Overridden for a camera-based gaussian model.
 
         Args:
-            camera: generates raybundle.
-            compute_semantics: Option to compute the semantic information of the scene.
+            camera: generates raybundle
         """
         assert camera is not None, "must provide camera to gaussian model"
         self.set_crop(obb_box)
@@ -1649,15 +1277,7 @@ class GemSplatModel(SplatfactoModel):
             A dictionary of metrics.
         """
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
-        d = self._get_downscale_factor()
-        if d > 1:
-            # torchvision can be slow to import, so we do it lazily.
-            import torchvision.transforms.functional as TF
-
-            newsize = [batch["image"].shape[0] // d, batch["image"].shape[1] // d]
-            predicted_rgb = TF.resize(outputs["rgb"].permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
-        else:
-            predicted_rgb = outputs["rgb"]
+        predicted_rgb = outputs["rgb"]
 
         combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
 
